@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -22,19 +23,57 @@ func (pe *processError) Error() string {
 	return fmt.Sprintf("process %s failed", pe.process.name)
 }
 
+// lifecycle is the state of one Run generation. All three channels are
+// created together and only ever closed, never sent to:
+//   - started is closed when Run enters this generation,
+//   - stop is closed when shutdown is requested for this generation,
+//   - done is closed when Run has finished the whole shutdown sequence.
+//
+// A Stop requested before any Run closes stop on generation 0; Run
+// adopts that already-closed stop channel when it starts.
+type lifecycle struct {
+	started chan struct{}
+	stop    chan struct{}
+	done    chan struct{}
+}
+
+func newLifecycle() *lifecycle {
+	return &lifecycle{
+		started: make(chan struct{}),
+		stop:    make(chan struct{}),
+		done:    make(chan struct{}),
+	}
+}
+
+func (lc *lifecycle) stopping() bool {
+	select {
+	case <-lc.stop:
+		return true
+	default:
+		return false
+	}
+}
+
 type Supervisor struct {
 	name    string
 	output  *multiOutput
 	procs   []*process
-	stop    chan struct{}
 	timeout time.Duration
+
+	lcMu sync.Mutex
+	lc   *lifecycle
 }
 
 func New(name string, timeout time.Duration) *Supervisor {
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+
 	return &Supervisor{
-		timeout: 5 * time.Second,
+		timeout: timeout,
 		name:    name,
 		output:  &multiOutput{},
+		lc:      newLifecycle(),
 	}
 }
 
@@ -47,7 +86,9 @@ func (h *Supervisor) AddProcess(name string, command string, opts ...Opt) {
 		output:     h.output,
 		stopSignal: syscall.SIGINT,
 		env:        os.Environ(),
+		done:       make(chan struct{}),
 	}
+	close(proc.done)
 
 	parsedCmd, err := shlex.Split(command)
 	fatalOnErr(err)
@@ -70,11 +111,11 @@ func (h *Supervisor) AddProcess(name string, command string, opts ...Opt) {
 	h.procs = append(h.procs, proc)
 }
 
-func (h *Supervisor) runProcess(ctx context.Context, proc *process) error {
+func (h *Supervisor) runProcess(ctx context.Context, proc *process, stop <-chan struct{}) error {
 	restarts := 0
 
 	for {
-		proc.Run()
+		proc.Run(stop)
 
 		// supervisor is stopping, exit
 		if ctx.Err() != nil {
@@ -103,26 +144,40 @@ func (h *Supervisor) runProcess(ctx context.Context, proc *process) error {
 	}
 }
 
-func (h *Supervisor) waitForTimeoutOrInterrupt() {
-	select {
-	case <-time.After(h.timeout):
-	case <-h.stop:
-	}
-}
-
+// waitForExit runs the shutdown sequence. It only returns once every
+// process has been notified, the configured grace period has elapsed
+// for processes that are still alive and every remaining process has
+// been killed and reaped.
 func (h *Supervisor) waitForExit(ctx context.Context) {
 	<-ctx.Done()
 
 	fmt.Println("supervisor stopping")
 
 	for _, proc := range h.procs {
-		go proc.Interrupt()
+		proc.Interrupt()
 	}
 
-	h.waitForTimeoutOrInterrupt()
+	grace := time.NewTimer(h.timeout)
+	defer grace.Stop()
 
 	for _, proc := range h.procs {
-		go proc.Kill()
+		if !proc.Running() {
+			continue
+		}
+		select {
+		case <-proc.exited():
+		case <-grace.C:
+		}
+	}
+
+	for _, proc := range h.procs {
+		proc.Kill()
+	}
+
+	for _, proc := range h.procs {
+		// After context cancellation runProcess never starts another
+		// command, so this is the final done channel.
+		<-proc.exited()
 	}
 }
 
@@ -131,35 +186,108 @@ func (h *Supervisor) StartHttpListener() {
 }
 
 func (h *Supervisor) Run() error {
-	h.stop = make(chan struct{})
+	h.lcMu.Lock()
+	lc := h.lc
+	if isClosed(lc.started) {
+		// A previous Run published this generation; start a fresh one
+		// while preserving a Stop already queued for it.
+		next := newLifecycle()
+		if lc.stopping() {
+			close(next.stop)
+		}
+		lc = next
+		h.lc = lc
+	}
+	close(lc.started)
+	h.lcMu.Unlock()
 
-	ctx := context.Background()
-	ctx, cancel := context.WithCancel(ctx)
-	go func() {
-		<-h.stop
-		cancel()
+	stopped := lc.stopping()
+
+	defer func() {
+		h.lcMu.Lock()
+		// Publish the next generation. Carry a pending stop over only
+		// when this Run actually observed one; a Run that finished on its
+		// own leaves the next generation pristine even if a Stop lands
+		// during teardown.
+		next := newLifecycle()
+		if stopped {
+			close(next.stop)
+		}
+		h.lc = next
+		h.lcMu.Unlock()
+
+		close(lc.done)
 	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if lc.stopping() {
+		cancel()
+	} else {
+		go func() {
+			select {
+			case <-lc.stop:
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+	}
 
 	eg, egCtx := errgroup.WithContext(ctx)
 
 	for _, proc := range h.procs {
 		p := proc
 		eg.Go(func() error {
-			return h.runProcess(egCtx, p)
+			return h.runProcess(egCtx, p, lc.stop)
 		})
 	}
 
-	go h.waitForExit(egCtx)
+	shutdownDone := make(chan struct{})
+	go func() {
+		h.waitForExit(egCtx)
+		close(shutdownDone)
+	}()
 
-	return eg.Wait()
+	err := eg.Wait()
+
+	// Do not return until interrupt/kill and reaping have finished.
+	<-shutdownDone
+
+	return err
 }
 
+// Stop requests a graceful shutdown. Repeated calls, including repeated
+// signals during the grace period, are coalesced and do not extend or
+// reset the remaining wait time. When Run is active, Stop blocks until
+// the full shutdown sequence (interrupt, grace period, kill and reap)
+// has completed; a Stop requested before Run starts is delivered as
+// soon as Run begins.
 func (h *Supervisor) Stop() {
-	h.stop <- struct{}{}
+	h.lcMu.Lock()
+	lc := h.lc
+	active := isClosed(lc.started) && !isClosed(lc.done)
+	if !lc.stopping() {
+		close(lc.stop)
+	}
+	h.lcMu.Unlock()
+
+	if active {
+		<-lc.done
+	}
+}
+
+func isClosed(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
 }
 
 func (h *Supervisor) StopOnSignal(sigs ...os.Signal) {
-	sigch := make(chan os.Signal)
+	sigch := make(chan os.Signal, 1)
 	signal.Notify(sigch, sigs...)
 
 	go func() {
