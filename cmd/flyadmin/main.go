@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/fly-examples/postgres-ha/pkg/flypg/admin"
 	"github.com/jackc/pgx/v4"
 )
 
@@ -150,24 +151,22 @@ func listUsers(pg *pgx.Conn, input map[string]interface{}) (interface{}, error) 
 }
 
 func createUser(pg *pgx.Conn, input map[string]interface{}) (interface{}, error) {
-	sql := fmt.Sprintf(`CREATE USER %q WITH LOGIN PASSWORD '%s'`, input["username"], input["password"])
-
-	_, err := pg.Exec(context.Background(), sql)
+	err := admin.CreateUser(context.Background(), pg, inputString(input, "username"), inputString(input, "password"))
 	if err != nil {
 		return false, err
 	}
 
 	if val, ok := input["superuser"]; ok && val == true {
-		return grantSuperuser(pg, input)
+		if _, err := grantSuperuser(pg, input); err != nil {
+			return false, err
+		}
 	}
 
 	return true, nil
 }
 
 func deleteUser(pg *pgx.Conn, input map[string]interface{}) (interface{}, error) {
-	sql := fmt.Sprintf(`DROP USER IF EXISTS %q`, input["username"])
-
-	_, err := pg.Exec(context.Background(), sql)
+	err := admin.DeleteUser(context.Background(), pg, inputString(input, "username"))
 	if err != nil {
 		return false, err
 	}
@@ -176,9 +175,7 @@ func deleteUser(pg *pgx.Conn, input map[string]interface{}) (interface{}, error)
 }
 
 func createDatabase(pg *pgx.Conn, input map[string]interface{}) (interface{}, error) {
-	sql := fmt.Sprintf("CREATE DATABASE %q;", input["name"])
-
-	_, err := pg.Exec(context.Background(), sql)
+	err := admin.CreateDatabase(context.Background(), pg, inputString(input, "name"))
 	if err != nil {
 		return false, err
 	}
@@ -187,9 +184,7 @@ func createDatabase(pg *pgx.Conn, input map[string]interface{}) (interface{}, er
 }
 
 func deleteDatabase(pg *pgx.Conn, input map[string]interface{}) (interface{}, error) {
-	sql := fmt.Sprintf("DROP DATABASE %q;", input["name"])
-
-	_, err := pg.Exec(context.Background(), sql)
+	err := admin.DeleteDatabase(context.Background(), pg, inputString(input, "name"))
 	if err != nil {
 		return false, err
 	}
@@ -198,9 +193,7 @@ func deleteDatabase(pg *pgx.Conn, input map[string]interface{}) (interface{}, er
 }
 
 func grantAccess(pg *pgx.Conn, input map[string]interface{}) (interface{}, error) {
-	sql := fmt.Sprintf("GRANT ALL PRIVILEGES ON DATABASE %q TO %q", input["database"], input["username"])
-
-	_, err := pg.Exec(context.Background(), sql)
+	err := admin.GrantAccess(context.Background(), pg, inputString(input, "database"), inputString(input, "username"))
 	if err != nil {
 		return false, err
 	}
@@ -209,9 +202,7 @@ func grantAccess(pg *pgx.Conn, input map[string]interface{}) (interface{}, error
 }
 
 func revokeAccess(pg *pgx.Conn, input map[string]interface{}) (interface{}, error) {
-	sql := fmt.Sprintf("REVOKE ALL PRIVILEGES ON DATABASE %q FROM %q", input["database"], input["username"])
-
-	_, err := pg.Exec(context.Background(), sql)
+	err := admin.RevokeAccess(context.Background(), pg, inputString(input, "database"), inputString(input, "username"))
 	if err != nil {
 		return false, err
 	}
@@ -220,9 +211,7 @@ func revokeAccess(pg *pgx.Conn, input map[string]interface{}) (interface{}, erro
 }
 
 func grantSuperuser(pg *pgx.Conn, input map[string]interface{}) (interface{}, error) {
-	sql := fmt.Sprintf("ALTER USER %q WITH SUPERUSER;", input["username"])
-
-	_, err := pg.Exec(context.Background(), sql)
+	err := admin.GrantSuperuser(context.Background(), pg, inputString(input, "username"))
 	if err != nil {
 		return false, err
 	}
@@ -231,14 +220,24 @@ func grantSuperuser(pg *pgx.Conn, input map[string]interface{}) (interface{}, er
 }
 
 func revokeSuperuser(pg *pgx.Conn, input map[string]interface{}) (interface{}, error) {
-	sql := fmt.Sprintf("ALTER USER %q WITH NOSUPERUSER;", input["username"])
-
-	_, err := pg.Exec(context.Background(), sql)
+	err := admin.RevokeSuperuser(context.Background(), pg, inputString(input, "username"))
 	if err != nil {
 		return false, err
 	}
 
 	return true, nil
+}
+
+// inputString extracts a string argument from the JSON command input. A
+// missing or non-string value is returned as the empty string, matching
+// the previous behavior of formatting the nil/interface{} value into SQL.
+func inputString(input map[string]interface{}, key string) string {
+	value, ok := input[key]
+	if !ok {
+		return ""
+	}
+	str, _ := value.(string)
+	return str
 }
 
 func openLeaderConnection(hostname string) (*pgx.Conn, error) {

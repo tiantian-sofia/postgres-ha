@@ -75,7 +75,7 @@ func handleCreateUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if input.Database != "" {
-		err = admin.GrantAccess(r.Context(), conn, input.Username, input.Database)
+		err = admin.GrantAccess(r.Context(), conn, input.Database, input.Username)
 		if err != nil {
 			render.Err(w, err)
 			return

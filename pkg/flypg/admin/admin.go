@@ -3,7 +3,6 @@ package admin
 import (
 	"bufio"
 	"context"
-	"crypto/md5"
 	"fmt"
 	"github.com/pkg/errors"
 	"os"
@@ -14,9 +13,7 @@ import (
 )
 
 func CreateUser(ctx context.Context, pg *pgx.Conn, username string, password string) error {
-	sql := fmt.Sprintf(`CREATE USER %s WITH LOGIN PASSWORD '%s'`, username, password)
-
-	_, err := pg.Exec(ctx, sql)
+	_, err := pg.Exec(ctx, createUserSQL(username, password))
 	if err != nil {
 		return err
 	}
@@ -25,9 +22,7 @@ func CreateUser(ctx context.Context, pg *pgx.Conn, username string, password str
 }
 
 func GrantSuperuser(ctx context.Context, pg *pgx.Conn, username string) error {
-	sql := fmt.Sprintf("ALTER USER %s WITH SUPERUSER;", username)
-
-	_, err := pg.Exec(ctx, sql)
+	_, err := pg.Exec(ctx, grantSuperuserSQL(username))
 	if err != nil {
 		return err
 	}
@@ -36,9 +31,25 @@ func GrantSuperuser(ctx context.Context, pg *pgx.Conn, username string) error {
 }
 
 func GrantReplication(ctx context.Context, pg *pgx.Conn, username string) error {
-	sql := fmt.Sprintf("ALTER USER %s WITH REPLICATION;", username)
+	_, err := pg.Exec(ctx, grantReplicationSQL(username))
+	if err != nil {
+		return err
+	}
 
-	_, err := pg.Exec(ctx, sql)
+	return nil
+}
+
+func RevokeSuperuser(ctx context.Context, pg *pgx.Conn, username string) error {
+	_, err := pg.Exec(ctx, revokeSuperuserSQL(username))
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func RevokeReplication(ctx context.Context, pg *pgx.Conn, username string) error {
+	_, err := pg.Exec(ctx, revokeReplicationSQL(username))
 	if err != nil {
 		return err
 	}
@@ -47,9 +58,7 @@ func GrantReplication(ctx context.Context, pg *pgx.Conn, username string) error 
 }
 
 func ChangePassword(ctx context.Context, pg *pgx.Conn, username, password string) error {
-	sql := fmt.Sprintf("ALTER USER %s WITH LOGIN PASSWORD '%s';", username, password)
-
-	_, err := pg.Exec(ctx, sql)
+	_, err := pg.Exec(ctx, changePasswordSQL(username, password))
 	if err != nil {
 		return err
 	}
@@ -92,15 +101,6 @@ type UserInfo struct {
 	ReplUser     bool     `json:"repluser"`
 	Databases    []string `json:"databases"`
 	PasswordHash string   `json:"-"`
-}
-
-func (ui UserInfo) IsPassword(password string) bool {
-	if !strings.HasPrefix(ui.PasswordHash, "md5") {
-		return false
-	}
-
-	encoded := fmt.Sprintf("md5%x", md5.Sum([]byte(password+ui.Username)))
-	return encoded == ui.PasswordHash
 }
 
 type DbInfo struct {
@@ -161,11 +161,9 @@ func FindUser(ctx context.Context, pg *pgx.Conn, username string) (*UserInfo, er
 		allowed_databases
     FROM 
 		pg_user u join pg_authid a on u.usesysid = a.oid 
-	WHERE u.usename='%s';`
+	WHERE u.usename=$1;`
 
-	sql = fmt.Sprintf(sql, username)
-
-	row := pg.QueryRow(ctx, sql)
+	row := pg.QueryRow(ctx, sql, username)
 
 	var user = UserInfo{}
 
@@ -177,9 +175,7 @@ func FindUser(ctx context.Context, pg *pgx.Conn, username string) (*UserInfo, er
 }
 
 func DeleteUser(ctx context.Context, pg *pgx.Conn, username string) error {
-	sql := fmt.Sprintf("DROP USER %s", username)
-
-	_, err := pg.Exec(ctx, sql)
+	_, err := pg.Exec(ctx, deleteUserSQL(username))
 	if err != nil {
 		return err
 	}
@@ -188,9 +184,7 @@ func DeleteUser(ctx context.Context, pg *pgx.Conn, username string) error {
 }
 
 func CreateDatabase(ctx context.Context, pg *pgx.Conn, name string) error {
-	sql := fmt.Sprintf("CREATE DATABASE %s;", name)
-
-	_, err := pg.Exec(ctx, sql)
+	_, err := pg.Exec(ctx, createDatabaseSQL(name))
 	if err != nil {
 		return err
 	}
@@ -199,9 +193,7 @@ func CreateDatabase(ctx context.Context, pg *pgx.Conn, name string) error {
 }
 
 func DeleteDatabase(ctx context.Context, pg *pgx.Conn, name string) error {
-	sql := fmt.Sprintf("DROP DATABASE %s;", name)
-
-	_, err := pg.Exec(ctx, sql)
+	_, err := pg.Exec(ctx, deleteDatabaseSQL(name))
 	if err != nil {
 		return err
 	}
@@ -214,12 +206,9 @@ func FindDatabase(ctx context.Context, pg *pgx.Conn, name string) (*DbInfo, erro
 	SELECT 
 		datname, 
 		(SELECT array_agg(u.usename::text order by u.usename) FROM pg_user u WHERE has_database_privilege(u.usename, d.datname, 'CONNECT')) as allowed_users 
-	FROM pg_database d WHERE d.datname='%s';
+	FROM pg_database d WHERE d.datname=$1;
 	`
-
-	sql = fmt.Sprintf(sql, name)
-
-	row := pg.QueryRow(ctx, sql)
+	row := pg.QueryRow(ctx, sql, name)
 
 	db := new(DbInfo)
 	if err := row.Scan(&db.Name, &db.Users); err != nil {
@@ -230,9 +219,16 @@ func FindDatabase(ctx context.Context, pg *pgx.Conn, name string) (*DbInfo, erro
 }
 
 func GrantAccess(ctx context.Context, pg *pgx.Conn, database, username string) error {
-	sql := fmt.Sprintf("GRANT ALL PRIVILEGES ON DATABASE %q TO %q", database, username)
+	_, err := pg.Exec(ctx, grantAccessSQL(database, username))
+	if err != nil {
+		return err
+	}
 
-	_, err := pg.Exec(ctx, sql)
+	return nil
+}
+
+func RevokeAccess(ctx context.Context, pg *pgx.Conn, database, username string) error {
+	_, err := pg.Exec(ctx, revokeAccessSQL(database, username))
 	if err != nil {
 		return err
 	}
@@ -297,9 +293,10 @@ func SetReadonly(ctx context.Context, pg *pgx.Conn, enable bool) error {
 			continue
 		}
 
-		sql := fmt.Sprintf("ALTER DATABASE %q SET default_transaction_read_only=%v;", db.Name, enable)
+		sql := fmt.Sprintf("ALTER DATABASE %s SET default_transaction_read_only=%v",
+			quoteIdentifier(db.Name), enable)
 		if _, err = pg.Exec(ctx, sql); err != nil {
-			return fmt.Errorf("failed to alter readonly state on db %s: %s", db.Name, err)
+			return fmt.Errorf("failed to alter readonly state on db %s: %w", db.Name, err)
 		}
 	}
 
@@ -311,7 +308,12 @@ func ResolveSettings(ctx context.Context, pg *pgx.Conn, list []string) (*flypg.S
 	if err != nil {
 		return nil, err
 	}
-	sValues := "'" + strings.Join(list, "', '") + "'"
+	placeholders := make([]string, len(list))
+	args := make([]interface{}, len(list))
+	for i, name := range list {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+		args[i] = name
+	}
 
 	sql := fmt.Sprintf(`
 	SELECT
@@ -325,9 +327,9 @@ func ResolveSettings(ctx context.Context, pg *pgx.Conn, list []string) (*flypg.S
 		unit, 
 		short_desc, 
 		pending_restart 
-	FROM pg_settings WHERE name IN (%s);`, sValues)
+	FROM pg_settings WHERE name IN (%s);`, strings.Join(placeholders, ", "))
 
-	rows, err := pg.Query(ctx, sql)
+	rows, err := pg.Query(ctx, sql, args...)
 	if err != nil {
 		return nil, err
 	}

@@ -241,7 +241,10 @@ func initOperator(ctx context.Context, pg *pgx.Conn, creds flypg.Credentials) er
 		}
 	}
 
-	if !operatorUser.IsPassword(creds.Password) {
+	match, err := operatorUser.PasswordMatches(creds.Password)
+	if err != nil {
+		fmt.Printf("cannot verify operator password, leaving it unchanged: %s\n", err)
+	} else if !match {
 		fmt.Println("operator password does not match config, changing")
 		if err := admin.ChangePassword(ctx, pg, creds.Username, creds.Password); err != nil {
 			return err
@@ -298,7 +301,10 @@ func initReplicationUser(ctx context.Context, pg *pgx.Conn, creds flypg.Credenti
 		}
 	}
 
-	if !replUser.IsPassword(creds.Password) {
+	match, err := replUser.PasswordMatches(creds.Password)
+	if err != nil {
+		fmt.Printf("cannot verify repluser password, leaving it unchanged: %s\n", err)
+	} else if !match {
 		fmt.Println("repluser password does not match config, changing")
 		if err := admin.ChangePassword(ctx, pg, creds.Username, creds.Password); err != nil {
 			return err
