@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"os/exec"
 	"sync"
 
 	"github.com/pkg/term/termios"
@@ -14,30 +15,42 @@ type ptyPipe struct {
 	pty, tty *os.File
 }
 
+// newPipe opens the parent-side read file and the child-side file wired to
+// the process stdio. Production uses a PTY; the indirection lets tests swap
+// in plain pipes where the legacy termios dependency cannot open a PTY.
+var newPipe = func() (parent, child *os.File, isTTY bool, err error) {
+	pty, tty, err := termios.Pty()
+	return pty, tty, true, err
+}
+
 type multiOutput struct {
 	maxNameLength int
 	mutex         sync.Mutex
 	pipes         map[*process]*ptyPipe
 }
 
-func (m *multiOutput) openPipe(proc *process) (pipe *ptyPipe) {
-	var err error
-
+func (m *multiOutput) openPipe(proc *process, cmd *exec.Cmd) (pipe *ptyPipe) {
+	m.mutex.Lock()
 	pipe = m.pipes[proc]
+	m.mutex.Unlock()
 
-	pipe.pty, pipe.tty, err = termios.Pty()
+	parent, child, isTTY, err := newPipe()
 	fatalOnErr(err)
 
-	proc.cmd.Stdout = pipe.tty
-	proc.cmd.Stderr = pipe.tty
-	proc.cmd.Stdin = pipe.tty
-	proc.cmd.SysProcAttr.Setctty = true
-	proc.cmd.SysProcAttr.Setsid = true
+	pipe.pty, pipe.tty = parent, child
+	cmd.Stdout = child
+	cmd.Stderr = child
+	cmd.Stdin = child
+	cmd.SysProcAttr.Setctty = isTTY
+	cmd.SysProcAttr.Setsid = true
 
-	return
+	return pipe
 }
 
 func (m *multiOutput) Connect(proc *process) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
 	if len(proc.name) > m.maxNameLength {
 		m.maxNameLength = len(proc.name)
 	}
@@ -49,8 +62,8 @@ func (m *multiOutput) Connect(proc *process) {
 	m.pipes[proc] = &ptyPipe{}
 }
 
-func (m *multiOutput) PipeOutput(proc *process) {
-	pipe := m.openPipe(proc)
+func (m *multiOutput) PipeOutput(proc *process, cmd *exec.Cmd) {
+	pipe := m.openPipe(proc, cmd)
 
 	go func(proc *process, pipe *ptyPipe) {
 		scanner := bufio.NewScanner(pipe.pty)
@@ -62,7 +75,11 @@ func (m *multiOutput) PipeOutput(proc *process) {
 }
 
 func (m *multiOutput) ClosePipe(proc *process) {
-	if pipe := m.pipes[proc]; pipe != nil {
+	m.mutex.Lock()
+	pipe := m.pipes[proc]
+	m.mutex.Unlock()
+
+	if pipe != nil {
 		pipe.pty.Close()
 		pipe.tty.Close()
 	}

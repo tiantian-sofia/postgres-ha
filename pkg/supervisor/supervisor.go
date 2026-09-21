@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -28,13 +29,17 @@ type Supervisor struct {
 	procs   []*process
 	stop    chan struct{}
 	timeout time.Duration
+
+	stopOnce     sync.Once
+	shutdownOnce sync.Once
 }
 
 func New(name string, timeout time.Duration) *Supervisor {
 	return &Supervisor{
-		timeout: 5 * time.Second,
+		timeout: timeout,
 		name:    name,
 		output:  &multiOutput{},
+		stop:    make(chan struct{}),
 	}
 }
 
@@ -103,26 +108,52 @@ func (h *Supervisor) runProcess(ctx context.Context, proc *process) error {
 	}
 }
 
-func (h *Supervisor) waitForTimeoutOrInterrupt() {
-	select {
-	case <-time.After(h.timeout):
-	case <-h.stop:
-	}
-}
+// crashGrace is the teardown window when the supervisor dies on its own
+// (a process exhausted its restart budget): sibling processes get a brief
+// chance to leave cleanly before being killed.
+var crashGrace = 5 * time.Second
 
-func (h *Supervisor) waitForExit(ctx context.Context) {
-	<-ctx.Done()
+// stopProcesses performs the full teardown: initial stopSignal, wait out the
+// grace period, then escalate survivors to SIGKILL and reap them before Run
+// is allowed to return. It runs exactly once, so repeated SIGTERMs cannot
+// restart it and reset the remaining grace period.
+func (h *Supervisor) stopProcesses(grace time.Duration) {
+	h.shutdownOnce.Do(func() {
+		fmt.Println("supervisor stopping")
+		for _, proc := range h.procs {
+			proc.Interrupt()
+		}
+	})
 
-	fmt.Println("supervisor stopping")
-
+	waiting := make([]*process, 0, len(h.procs))
 	for _, proc := range h.procs {
-		go proc.Interrupt()
+		if proc.isRunning() {
+			waiting = append(waiting, proc)
+		}
 	}
 
-	h.waitForTimeoutOrInterrupt()
+	if grace > 0 {
+		deadline := time.Now().Add(grace)
+		for _, proc := range waiting {
+			proc.wait(deadline)
+		}
+	}
 
+	killing := make([]*process, 0, len(h.procs))
 	for _, proc := range h.procs {
-		go proc.Kill()
+		if proc.isRunning() {
+			killing = append(killing, proc)
+		}
+	}
+	for _, proc := range killing {
+		proc.Kill()
+	}
+
+	// SIGKILL is untrappable, but give reap a bounded moment before returning
+	// so Run() cannot leave zombies behind for Pdeathsig to clean up.
+	killDeadline := time.Now().Add(5 * time.Second)
+	for _, proc := range killing {
+		proc.wait(killDeadline)
 	}
 }
 
@@ -131,13 +162,15 @@ func (h *Supervisor) StartHttpListener() {
 }
 
 func (h *Supervisor) Run() error {
-	h.stop = make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	ctx := context.Background()
-	ctx, cancel := context.WithCancel(ctx)
 	go func() {
-		<-h.stop
-		cancel()
+		select {
+		case <-h.stop:
+			cancel()
+		case <-ctx.Done():
+		}
 	}()
 
 	eg, egCtx := errgroup.WithContext(ctx)
@@ -149,17 +182,40 @@ func (h *Supervisor) Run() error {
 		})
 	}
 
-	go h.waitForExit(egCtx)
+	// Teardown must progress concurrently with eg.Wait(): processes that
+	// ignore their stopSignal are only reaped by the SIGKILL escalation, and
+	// eg.Wait cannot return while they are still alive. An explicit Stop gets
+	// the configured grace period; a self-initiated shutdown (a process gave
+	// up restarting) stays fast so the crash is not delayed.
+	shutdownDone := make(chan struct{})
+	go func() {
+		grace := crashGrace
+		select {
+		case <-h.stop:
+			grace = h.timeout
+		case <-egCtx.Done():
+		}
+		h.stopProcesses(grace)
+		close(shutdownDone)
+	}()
 
-	return eg.Wait()
+	err := eg.Wait()
+	<-shutdownDone
+
+	return err
 }
 
+// Stop signals the supervisor to begin shutting down. It is idempotent and
+// never blocks: repeated SIGTERMs arrive on an already-closed channel and
+// cannot reset the remaining grace period.
 func (h *Supervisor) Stop() {
-	h.stop <- struct{}{}
+	h.stopOnce.Do(func() {
+		close(h.stop)
+	})
 }
 
 func (h *Supervisor) StopOnSignal(sigs ...os.Signal) {
-	sigch := make(chan os.Signal)
+	sigch := make(chan os.Signal, 1)
 	signal.Notify(sigch, sigs...)
 
 	go func() {
