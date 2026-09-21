@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/fly-examples/postgres-ha/pkg/flypg/admin"
 	"github.com/jackc/pgx/v4"
 )
 
@@ -150,14 +151,14 @@ func listUsers(pg *pgx.Conn, input map[string]interface{}) (interface{}, error) 
 }
 
 func createUser(pg *pgx.Conn, input map[string]interface{}) (interface{}, error) {
-	sql := fmt.Sprintf(`CREATE USER %q WITH LOGIN PASSWORD '%s'`, input["username"], input["password"])
+	username := inputString(input, "username")
+	password := inputString(input, "password")
 
-	_, err := pg.Exec(context.Background(), sql)
-	if err != nil {
+	if err := admin.CreateUser(context.Background(), pg, username, password); err != nil {
 		return false, err
 	}
 
-	if val, ok := input["superuser"]; ok && val == true {
+	if superuser, _ := input["superuser"].(bool); superuser {
 		return grantSuperuser(pg, input)
 	}
 
@@ -165,80 +166,60 @@ func createUser(pg *pgx.Conn, input map[string]interface{}) (interface{}, error)
 }
 
 func deleteUser(pg *pgx.Conn, input map[string]interface{}) (interface{}, error) {
-	sql := fmt.Sprintf(`DROP USER IF EXISTS %q`, input["username"])
-
-	_, err := pg.Exec(context.Background(), sql)
-	if err != nil {
+	if err := admin.DeleteUserIfExists(context.Background(), pg, inputString(input, "username")); err != nil {
 		return false, err
 	}
-
 	return true, nil
 }
 
 func createDatabase(pg *pgx.Conn, input map[string]interface{}) (interface{}, error) {
-	sql := fmt.Sprintf("CREATE DATABASE %q;", input["name"])
-
-	_, err := pg.Exec(context.Background(), sql)
-	if err != nil {
+	if err := admin.CreateDatabase(context.Background(), pg, inputString(input, "name")); err != nil {
 		return false, err
 	}
-
 	return true, nil
 }
 
 func deleteDatabase(pg *pgx.Conn, input map[string]interface{}) (interface{}, error) {
-	sql := fmt.Sprintf("DROP DATABASE %q;", input["name"])
-
-	_, err := pg.Exec(context.Background(), sql)
-	if err != nil {
+	if err := admin.DeleteDatabase(context.Background(), pg, inputString(input, "name")); err != nil {
 		return false, err
 	}
-
 	return true, nil
 }
 
 func grantAccess(pg *pgx.Conn, input map[string]interface{}) (interface{}, error) {
-	sql := fmt.Sprintf("GRANT ALL PRIVILEGES ON DATABASE %q TO %q", input["database"], input["username"])
-
-	_, err := pg.Exec(context.Background(), sql)
-	if err != nil {
+	if err := admin.GrantAccess(context.Background(), pg, inputString(input, "database"), inputString(input, "username")); err != nil {
 		return false, err
 	}
-
 	return true, nil
 }
 
 func revokeAccess(pg *pgx.Conn, input map[string]interface{}) (interface{}, error) {
-	sql := fmt.Sprintf("REVOKE ALL PRIVILEGES ON DATABASE %q FROM %q", input["database"], input["username"])
-
-	_, err := pg.Exec(context.Background(), sql)
-	if err != nil {
+	if err := admin.RevokeAccess(context.Background(), pg, inputString(input, "database"), inputString(input, "username")); err != nil {
 		return false, err
 	}
-
 	return true, nil
 }
 
 func grantSuperuser(pg *pgx.Conn, input map[string]interface{}) (interface{}, error) {
-	sql := fmt.Sprintf("ALTER USER %q WITH SUPERUSER;", input["username"])
-
-	_, err := pg.Exec(context.Background(), sql)
-	if err != nil {
+	if err := admin.GrantSuperuser(context.Background(), pg, inputString(input, "username")); err != nil {
 		return false, err
 	}
-
 	return true, nil
 }
 
 func revokeSuperuser(pg *pgx.Conn, input map[string]interface{}) (interface{}, error) {
-	sql := fmt.Sprintf("ALTER USER %q WITH NOSUPERUSER;", input["username"])
-
-	_, err := pg.Exec(context.Background(), sql)
-	if err != nil {
+	if err := admin.RevokeSuperuser(context.Background(), pg, inputString(input, "username")); err != nil {
 		return false, err
 	}
-
 	return true, nil
+}
+
+// inputString reads a string value from the command input map. Missing or
+// non-string values produce an empty string, which PostgreSQL rejects as an
+// invalid identifier.
+func inputString(input map[string]interface{}, key string) string {
+	value, _ := input[key].(string)
+	return value
 }
 
 func openLeaderConnection(hostname string) (*pgx.Conn, error) {

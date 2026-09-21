@@ -181,23 +181,21 @@ func createRequiredUsers(conn *pgx.Conn) error {
 				exists = true
 			}
 		}
-		var sql string
-
+		var err error
 		if exists {
-			sql = fmt.Sprintf("ALTER USER %s WITH PASSWORD '%s'", user, pass)
+			_, err = conn.Exec(context.Background(), admin.AlterUserPasswordSQL(user, pass))
 		} else {
 			// create user
 			switch user {
 			case "flypgadmin":
-				sql = fmt.Sprintf(`CREATE USER %s WITH SUPERUSER LOGIN PASSWORD '%s'`, user, pass)
+				_, err = conn.Exec(context.Background(), admin.CreateSuperuserSQL(user, pass))
 			case "repluser":
-				sql = fmt.Sprintf(`CREATE USER %s WITH REPLICATION PASSWORD '%s'`, user, pass)
+				_, err = conn.Exec(context.Background(), admin.CreateReplicationUserSQL(user, pass))
 			case "postgres":
-				sql = fmt.Sprintf(`CREATE USER %s WITH LOGIN PASSWORD '%s'`, user, pass)
+				err = admin.CreateUser(context.Background(), conn, user, pass)
 			}
 		}
 
-		_, err := conn.Exec(context.Background(), sql)
 		if err != nil {
 			return err
 		}

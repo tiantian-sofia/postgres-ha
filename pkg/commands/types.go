@@ -4,7 +4,10 @@ type createUserRequest struct {
 	Username  string `json:"username"`
 	Password  string `json:"password"`
 	Superuser bool   `json:"superuser"`
-	Database  string `json:"databases"`
+	// Database is the single database to grant the new user access to. The
+	// JSON tag stays "databases" for compatibility with existing flyctl
+	// clients; only one database name is accepted.
+	Database string `json:"databases"`
 }
 
 type createDatabaseRequest struct {

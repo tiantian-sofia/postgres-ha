@@ -241,11 +241,14 @@ func initOperator(ctx context.Context, pg *pgx.Conn, creds flypg.Credentials) er
 		}
 	}
 
-	if !operatorUser.IsPassword(creds.Password) {
+	switch operatorUser.ComparePassword(creds.Password) {
+	case admin.PasswordMismatch:
 		fmt.Println("operator password does not match config, changing")
 		if err := admin.ChangePassword(ctx, pg, creds.Username, creds.Password); err != nil {
 			return err
 		}
+	case admin.PasswordMatchUnknown:
+		fmt.Println("operator password stored in an unrecognized format, leaving unchanged")
 	}
 
 	fmt.Println("operator ready!")
@@ -298,11 +301,14 @@ func initReplicationUser(ctx context.Context, pg *pgx.Conn, creds flypg.Credenti
 		}
 	}
 
-	if !replUser.IsPassword(creds.Password) {
+	switch replUser.ComparePassword(creds.Password) {
+	case admin.PasswordMismatch:
 		fmt.Println("repluser password does not match config, changing")
 		if err := admin.ChangePassword(ctx, pg, creds.Username, creds.Password); err != nil {
 			return err
 		}
+	case admin.PasswordMatchUnknown:
+		fmt.Println("repluser password stored in an unrecognized format, leaving unchanged")
 	}
 
 	fmt.Println("replication ready!")
